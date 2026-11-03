@@ -29,6 +29,8 @@ end;
 
 var
   Lines: TStringList;
+  Stream: TFileStream;
+  Raw: RawByteString;
   I, P, Total, Fail: Integer;
   Line, Typed, Expected, Got: string;
 begin
@@ -42,10 +44,20 @@ begin
   Fail := 0;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(ParamStr(1), TEncoding.UTF8);
+    // read raw bytes and decode UTF-8 ourselves (independent of TStringList encoding rules)
+    Stream := TFileStream.Create(ParamStr(1), fmOpenRead or fmShareDenyWrite);
+    try
+      SetLength(Raw, Stream.Size);
+      if Stream.Size > 0 then
+        Stream.ReadBuffer(Raw[1], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+    Lines.Text := UTF8Decode(Raw);
     for I := 0 to Lines.Count - 1 do
     begin
       Line := Lines[I];
+      Line := StringReplace(Line, #13, '', [rfReplaceAll]);
       if Trim(Line) = '' then
         Continue;
       P := Pos(#9, Line);
