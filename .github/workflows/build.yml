@@ -1,0 +1,151 @@
+name: Build Avro Keyboard (Poppy Layout)
+
+# ---------------------------------------------------------------------------
+#  1. poppy-engine-test  (GitHub-hosted, runs on every push / PR)
+#       Compiles the Poppy typing engine with Free Pascal and checks it against
+#       tests/typing_cases.tsv (339 typing examples).
+#
+#  2. build-windows      (SELF-HOSTED Windows runner that has Delphi installed)
+#       Builds all Avro projects in Release mode with MSBuild, renames the exe
+#       files the same way build-ce.bat does, zips everything and uploads it as
+#       an artifact. On a "v*" tag it also creates a GitHub Release.
+#
+#  Why self-hosted? Delphi is a commercial compiler. It cannot be installed on a
+#  GitHub-hosted runner, and the free Community Edition has no command-line
+#  compiler (see Readme.md). Install RAD Studio / Delphi (Professional or
+#  higher, which includes dcc32/dcc64) on a Windows PC, register it as a
+#  self-hosted runner with the labels  self-hosted, windows, delphi  and the
+#  second job will start automatically on every push.
+#
+#  Optional repository variable:
+#    RSVARS_PATH  full path of rsvars.bat
+#                 (default: Delphi 12 -> ...\Studio\23.0\bin\rsvars.bat)
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      portable:
+        description: "Build the Portable edition (adds {$Define PortableOn})"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # needed to attach files to a GitHub Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  poppy-engine-test:
+    name: Poppy engine tests (Free Pascal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Free Pascal
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fpc
+
+      - name: Compile PoppyTest
+        run: |
+          mkdir -p out
+          fpc -Fu"Keyboard and Spell checker/Classes" -FUout -FEout tests/PoppyTest.pas
+
+      - name: Run typing cases
+        run: out/PoppyTest tests/typing_cases.tsv
+
+  # -------------------------------------------------------------------------
+  build-windows:
+    name: Build with Delphi (self-hosted)
+    needs: poppy-engine-test
+    runs-on: [self-hosted, windows, delphi]
+    env:
+      RSVARS: ${{ vars.RSVARS_PATH || 'C:\Program Files (x86)\Embarcadero\Studio\23.0\bin\rsvars.bat' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        shell: powershell
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF_NAME.Substring(1)
+          } else {
+            $v = "0.0.$($env:GITHUB_RUN_NUMBER)"
+          }
+          $edition = if ("${{ inputs.portable }}" -eq "true") { "portable" } else { "standard" }
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "EDITION=$edition" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Prepare compiler directives
+        shell: powershell
+        run: |
+          $inc = "ProjectDefines.inc"
+          $t = Get-Content $inc -Raw
+          # no debug logging in CI builds
+          $t = $t -replace '(?m)^\{\$Define DebugLog\}', '{.$$Define DebugLog}'
+          if ($env:EDITION -eq "portable") {
+            $t = $t -replace '(?m)^\{\.\$Define PortableOn\}', '{$$Define PortableOn}'
+          }
+          Set-Content -Path $inc -Value $t -NoNewline
+          Get-Content $inc
+
+      - name: Clean previous output
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Get-ChildItem build -Include *.exe, *.dll -Recurse | Remove-Item -Force
+
+      - name: Build all projects (Release)
+        shell: cmd
+        run: |
+          if not exist "%RSVARS%" (
+            echo ::error::rsvars.bat not found at %RSVARS%. Install Delphi or set the RSVARS_PATH repository variable.
+            exit /b 1
+          )
+          call "%RSVARS%"
+          msbuild WholeProject.groupproj /t:Build /p:Config=Release /p:Platform=Win32 /v:minimal
+
+      - name: Collect and rename output
+        shell: powershell
+        run: |
+          $map = [ordered]@{
+            'Avro_Keyboard.exe'      = 'Avro Keyboard.exe'
+            'Avro_Spell_Checker.exe' = 'Avro Spell Checker.exe'
+            'LayoutEditor.exe'       = 'Layout Editor.exe'
+            'SkinDesigner.exe'       = 'Skin Designer.exe'
+            'Unicode_to_Bijoy.exe'   = 'Unicode to Bijoy.exe'
+          }
+          $dist = "dist\AvroKeyboard-Poppy-$($env:VERSION)-$($env:EDITION)"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          foreach ($k in $map.Keys) {
+            if (-not (Test-Path "build\$k")) { throw "Build output missing: $k" }
+            Copy-Item "build\$k" (Join-Path $dist $map[$k])
+          }
+          if (-not (Test-Path "build\AvroSpell.dll")) { throw "Build output missing: AvroSpell.dll" }
+          Copy-Item "build\AvroSpell.dll" $dist
+          Copy-Item "assets" (Join-Path $dist "assets") -Recurse
+          Copy-Item "docs\PoppyLayout.md" $dist
+          Copy-Item "LICENSE.txt" $dist
+          Compress-Archive -Path "$dist\*" -DestinationPath "$dist.zip" -Force
+          "ZIP=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AvroKeyboard-Poppy-${{ env.VERSION }}-${{ env.EDITION }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
