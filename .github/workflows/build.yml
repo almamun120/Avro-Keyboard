@@ -66,6 +66,10 @@ jobs:
   build-windows:
     name: Build with Delphi (self-hosted)
     needs: poppy-engine-test
+    # Runs only after you set the repository variable HAS_DELPHI_RUNNER = true
+    # (Settings -> Secrets and variables -> Actions -> Variables). Without a
+    # self-hosted runner this job would wait forever.
+    if: ${{ vars.HAS_DELPHI_RUNNER == 'true' }}
     runs-on: [self-hosted, windows, delphi]
     env:
       RSVARS: ${{ vars.RSVARS_PATH || 'C:\Program Files (x86)\Embarcadero\Studio\23.0\bin\rsvars.bat' }}
